@@ -23,6 +23,9 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.agent.StreamOptions;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.session.SessionExecution;
+import io.agentscope.core.session.SessionExportSink;
+import io.agentscope.core.session.SessionRecorder;
 import io.agentscope.harness.agent.HarnessAgent;
 import io.agentscope.harness.agent.middleware.SubagentEntry;
 import io.agentscope.harness.agent.tool.AgentSpawnTool;
@@ -67,11 +70,7 @@ public final class DefaultAgentManager {
         this.workspaceManager = workspaceManager;
     }
 
-    /**
-     * Replaces the current set of entries with a new snapshot. Called per-call from
-     * {@link io.agentscope.harness.agent.middleware.SubagentsMiddleware} to reflect per-user subagent
-     * configurations.
-     */
+    /** Replaces the current set of entries with a new snapshot. */
     public void refreshEntries(List<SubagentEntry> entries) {
         Map<String, SubagentFactory> factories = new HashMap<>();
         Map<String, SubagentDeclaration> decls = new HashMap<>();
@@ -177,7 +176,12 @@ public final class DefaultAgentManager {
      * @param prompt the user message to send
      */
     public Mono<Msg> invokeAgent(Agent agent, String sessionId, String userId, String prompt) {
-        RuntimeContext ctx = RuntimeContext.builder().sessionId(sessionId).userId(userId).build();
+        return invokeAgent(agent, sessionId, userId, prompt, null);
+    }
+
+    public Mono<Msg> invokeAgent(
+            Agent agent, String sessionId, String userId, String prompt, RuntimeContext parentRc) {
+        RuntimeContext ctx = childContext(sessionId, userId, parentRc);
         if (agent instanceof ReActAgent react) {
             return react.call(List.of(userMessage(prompt)), ctx);
         }
@@ -213,9 +217,20 @@ public final class DefaultAgentManager {
             String prompt,
             EventSource source,
             StreamOptions options) {
+        return invokeAgentStream(agent, sessionId, userId, prompt, source, options, null);
+    }
+
+    public Flux<Event> invokeAgentStream(
+            Agent agent,
+            String sessionId,
+            String userId,
+            String prompt,
+            EventSource source,
+            StreamOptions options,
+            RuntimeContext parentRc) {
         Flux<Event> childFlux;
         StreamOptions effective = options != null ? options : StreamOptions.defaults();
-        RuntimeContext ctx = RuntimeContext.builder().sessionId(sessionId).userId(userId).build();
+        RuntimeContext ctx = childContext(sessionId, userId, parentRc);
         if (agent instanceof ReActAgent react) {
             childFlux = react.stream(List.of(userMessage(prompt)), effective, ctx);
         } else if (agent instanceof HarnessAgent harness) {
@@ -224,6 +239,34 @@ public final class DefaultAgentManager {
             childFlux = agent.stream(List.of(userMessage(prompt)), effective);
         }
         return childFlux.map(event -> event.withSource(source));
+    }
+
+    private static RuntimeContext childContext(
+            String sessionId, String userId, RuntimeContext parent) {
+        RuntimeContext child =
+                parent == null
+                        ? RuntimeContext.builder().sessionId(sessionId).userId(userId).build()
+                        : RuntimeContext.builder(parent)
+                                .sessionId(sessionId)
+                                .userId(userId)
+                                .build();
+        var recorder = SessionRecorder.from(parent);
+        child.put(SessionRecorder.CONTEXT_KEY, null);
+        child.put(SessionRecorder.TURN_ID_KEY, null);
+        child.put(SessionExportSink.CONTEXT_KEY, null);
+        child.put(SessionExecution.CONTEXT_KEY, null);
+        child.setAgentState(null);
+        if (recorder != null)
+            child.put(
+                    SessionRecorder.PARENT_KEY,
+                    Map.of(
+                            "parentSessionId",
+                            parent.getSessionId(),
+                            "parentRunId",
+                            recorder.runId(),
+                            "parentTurnId",
+                            recorder.turnId()));
+        return child;
     }
 
     public WorkspaceManager getWorkspaceManager() {

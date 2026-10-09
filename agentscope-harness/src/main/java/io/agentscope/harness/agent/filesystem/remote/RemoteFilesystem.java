@@ -33,6 +33,9 @@ import io.agentscope.harness.agent.filesystem.remote.store.NamespaceFactory;
 import io.agentscope.harness.agent.filesystem.remote.store.StoreItem;
 import io.agentscope.harness.agent.filesystem.util.FilesystemUtils;
 import io.agentscope.harness.agent.workspace.WorkspaceIndex;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
@@ -140,6 +143,11 @@ public class RemoteFilesystem implements AbstractFilesystem {
         }
         List<String> frozen = List.copyOf(namespace);
         return rc -> frozen;
+    }
+
+    @Override
+    public io.agentscope.core.session.AtomicSessionStorage sessionStorage(RuntimeContext rc) {
+        return new io.agentscope.harness.agent.session.StoreSessionStorage(store, getNamespace(rc));
     }
 
     private List<String> getNamespace(RuntimeContext rc) {
@@ -425,8 +433,19 @@ public class RemoteFilesystem implements AbstractFilesystem {
                                         + (effectivePattern.startsWith("**")
                                                 ? effectivePattern
                                                 : "**/" + effectivePattern));
+        // Java NIO requires a path separator for patterns that start with "**/", so the
+        // recursive matcher does not match files located directly in the search root. Strip the
+        // recursive prefix for a second matcher that covers those root-level files.
+        String directPattern;
+        if (effectivePattern.startsWith("**/")) {
+            directPattern = effectivePattern.substring(3);
+        } else if (effectivePattern.equals("**")) {
+            directPattern = "*";
+        } else {
+            directPattern = effectivePattern;
+        }
         PathMatcher directMatcher =
-                FileSystems.getDefault().getPathMatcher("glob:" + effectivePattern);
+                FileSystems.getDefault().getPathMatcher("glob:" + directPattern);
 
         // Fast path: index has entries for this prefix
         if (index != null && index.hasPrefix(normalizedPath)) {
@@ -492,9 +511,15 @@ public class RemoteFilesystem implements AbstractFilesystem {
             String contentStr;
             String encoding;
             try {
-                contentStr = new String(content, StandardCharsets.UTF_8);
+                contentStr =
+                        StandardCharsets.UTF_8
+                                .newDecoder()
+                                .onMalformedInput(CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                                .decode(ByteBuffer.wrap(content))
+                                .toString();
                 encoding = "utf-8";
-            } catch (Exception e) {
+            } catch (CharacterCodingException e) {
                 contentStr = Base64.getEncoder().encodeToString(content);
                 encoding = "base64";
             }
@@ -530,7 +555,7 @@ public class RemoteFilesystem implements AbstractFilesystem {
 
             byte[] contentBytes;
             if ("base64".equals(fd.encoding())) {
-                contentBytes = Base64.getDecoder().decode(fd.content());
+                contentBytes = Base64.getMimeDecoder().decode(fd.content());
             } else {
                 contentBytes = fd.content().getBytes(StandardCharsets.UTF_8);
             }
@@ -629,13 +654,23 @@ public class RemoteFilesystem implements AbstractFilesystem {
             if (page.isEmpty()) {
                 break;
             }
-            all.addAll(page);
+            for (StoreItem item : page) {
+                all.add(normalizeItemKey(item));
+            }
             if (page.size() < pageSize) {
                 break;
             }
             offset += pageSize;
         }
         return all;
+    }
+
+    private static StoreItem normalizeItemKey(StoreItem item) {
+        String key = item.key();
+        if (key != null && !key.startsWith("/")) {
+            return new StoreItem("/" + key, item.value(), item.version());
+        }
+        return item;
     }
 
     private static FileData convertItemToFileData(StoreItem item) {

@@ -237,8 +237,11 @@ public class LocalFilesystem implements AbstractFilesystem {
     @Override
     public LsResult ls(RuntimeContext runtimeContext, String path) {
         Path dirPath = resolvePath(runtimeContext, path);
-        if (!Files.exists(dirPath) || !Files.isDirectory(dirPath)) {
-            return LsResult.success(List.of());
+        if (!Files.exists(dirPath)) {
+            return LsResult.fail("Path does not exist: " + path);
+        }
+        if (!Files.isDirectory(dirPath)) {
+            return LsResult.fail("Not a directory: " + path);
         }
 
         List<FileInfo> results = new ArrayList<>();
@@ -359,7 +362,10 @@ public class LocalFilesystem implements AbstractFilesystem {
         ReentrantLock lock = fileLocks.computeIfAbsent(lockKey, k -> new ReentrantLock());
         lock.lock();
         try {
-            String content = Files.readString(resolved, StandardCharsets.UTF_8);
+            String content =
+                    Files.readString(resolved, StandardCharsets.UTF_8)
+                            .replace("\r\n", "\n")
+                            .replace("\r", "\n");
             String normalizedOld = oldString.replace("\r\n", "\n").replace("\r", "\n");
             String normalizedNew = newString.replace("\r\n", "\n").replace("\r", "\n");
 
@@ -486,7 +492,7 @@ public class LocalFilesystem implements AbstractFilesystem {
                 responses.add(FileUploadResponse.success(filePath));
             } catch (IOException e) {
                 responses.add(FileUploadResponse.fail(filePath, e.getMessage()));
-            } catch (SecurityException e) {
+            } catch (SecurityException | IllegalArgumentException e) {
                 responses.add(FileUploadResponse.fail(filePath, "permission_denied"));
             }
         }
@@ -587,7 +593,17 @@ public class LocalFilesystem implements AbstractFilesystem {
         return namespaceFactory;
     }
 
+    @Override
+    public io.agentscope.core.session.AtomicSessionStorage sessionStorage(RuntimeContext rc) {
+        return new io.agentscope.harness.agent.session.LocalSessionStorage(
+                resolvePath(rc, ".").resolve(".agentscope-runtime"));
+    }
+
     protected Path resolvePath(RuntimeContext rc, String key) {
+        if (key != null
+                && java.util.Arrays.stream(key.replace('\\', '/').split("/"))
+                        .anyMatch(".agentscope-runtime"::equalsIgnoreCase))
+            throw new SecurityException("Session journal is reserved for the runtime");
         String effectiveKey = applyNamespacePrefix(rc, key);
         if (effectiveKey == null || effectiveKey.isBlank()) {
             return cwd;
@@ -625,21 +641,51 @@ public class LocalFilesystem implements AbstractFilesystem {
     }
 
     private Path resolveRooted(String effectiveKey) {
+        AbstractFilesystem.validatePath(effectiveKey);
         Path target = Path.of(effectiveKey);
         if (target.isAbsolute()) {
             Path normalized = target.normalize();
             if (normalized.startsWith(cwd) || pathPolicy.isAllowed(normalized)) {
                 return normalized;
             }
-            throw new SecurityException(
-                    "Absolute path "
-                            + normalized
-                            + " is not within an allowed root. Filesystem root: "
-                            + cwd
-                            + "; additional roots: "
-                            + pathPolicy.roots());
+            if (Files.exists(normalized)) {
+                throw rootAccessDenied(normalized);
+            }
+            if (!effectiveKey.startsWith("/")) {
+                throw rootAccessDenied(normalized);
+            }
         }
-        return cwd.resolve(target).normalize();
+
+        if (effectiveKey.startsWith("/")) {
+            String stripped = effectiveKey.substring(1);
+            if (stripped.isEmpty()) {
+                return cwd;
+            }
+            if (stripped.startsWith("~")) {
+                throw new SecurityException("Path traversal not allowed: " + effectiveKey);
+            }
+            Path full = cwd.resolve(stripped).normalize();
+            if (!full.startsWith(cwd)) {
+                throw new SecurityException("Path " + full + " outside root directory: " + cwd);
+            }
+            return full;
+        }
+
+        Path full = cwd.resolve(target).normalize();
+        if (!full.startsWith(cwd)) {
+            throw new SecurityException("Path " + full + " outside root directory: " + cwd);
+        }
+        return full;
+    }
+
+    private SecurityException rootAccessDenied(Path normalized) {
+        return new SecurityException(
+                "Absolute path "
+                        + normalized
+                        + " is not within an allowed root. Filesystem root: "
+                        + cwd
+                        + "; additional roots: "
+                        + pathPolicy.roots());
     }
 
     private Path resolveUnrestricted(String effectiveKey) {
@@ -654,12 +700,40 @@ public class LocalFilesystem implements AbstractFilesystem {
         if (namespaceFactory == null || key == null || key.isBlank()) {
             return key;
         }
+        // Absolute paths identify specific host locations and must not be namespace-scoped.
+        // Prepending a namespace prefix would turn them into relative paths, causing them to
+        // resolve incorrectly under the workspace root (e.g. /abs/path → ns//abs/path).
+        // On Windows, absolute paths start with a drive letter ("C:\") or UNC prefix ("\\"),
+        // not "/", so we must check for those forms explicitly.
+        if (isAbsolutePathString(key)) {
+            return key;
+        }
         List<String> ns = namespaceFactory.getNamespace(rc);
         if (ns == null || ns.isEmpty()) {
             return key;
         }
         String prefix = String.join("/", ns);
         return prefix + "/" + key;
+    }
+
+    /**
+     * Returns {@code true} when {@code key} looks like an absolute path on any supported OS:
+     * Unix ({@code /...}), Windows drive-letter ({@code C:\} or {@code C:/}), or Windows UNC
+     * ({@code \\server\share}).
+     */
+    private static boolean isAbsolutePathString(String key) {
+        if (key.startsWith("/")) {
+            return true;
+        }
+        // Windows drive-letter: "X:\" or "X:/"
+        if (key.length() >= 3
+                && Character.isLetter(key.charAt(0))
+                && key.charAt(1) == ':'
+                && (key.charAt(2) == '\\' || key.charAt(2) == '/')) {
+            return true;
+        }
+        // Windows UNC: "\\server\share"
+        return key.startsWith("\\\\");
     }
 
     protected String toVirtualPath(Path path) {

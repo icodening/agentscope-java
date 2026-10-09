@@ -24,16 +24,17 @@ import com.alibaba.dashscope.embeddings.MultiModalEmbeddingResultItem;
 import io.agentscope.core.embedding.EmbeddingException;
 import io.agentscope.core.embedding.EmbeddingModel;
 import io.agentscope.core.embedding.EmbeddingUtils;
-import io.agentscope.core.formatter.dashscope.DashScopeMediaConverter;
 import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.ImageBlock;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.model.ExecutionConfig;
+import io.agentscope.extensions.model.dashscope.formatter.DashScopeMediaConverter;
 import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * DashScope Multi-Modal Embedding Model implementation.
@@ -119,6 +120,7 @@ public class DashScopeMultiModalEmbedding implements EmbeddingModel {
                                                 "dashscope");
                                     }
                                 })
+                        .subscribeOn(Schedulers.boundedElastic())
                         .onErrorMap(
                                 e -> {
                                     if (e instanceof EmbeddingException) {

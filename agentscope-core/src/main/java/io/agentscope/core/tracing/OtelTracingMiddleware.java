@@ -28,14 +28,21 @@ import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.model.Model;
 import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
-import io.opentelemetry.context.Scope;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.instrumentation.reactor.v3_1.ContextPropagationOperator;
+import java.util.EnumSet;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import reactor.core.publisher.Flux;
+import reactor.util.context.ContextView;
 
 /**
  * Middleware that adds OpenTelemetry tracing to the agent lifecycle.
@@ -47,9 +54,23 @@ import reactor.core.publisher.Flux;
  *   <li>{@code execute_tool <name>} — wraps each tool execution</li>
  * </ul>
  *
+ * <p>Model-call spans report input/output token usage and the available cache, reasoning, and
+ * tool-prompt token breakdowns using GenAI semantic-convention attributes. The tool-prompt
+ * breakdown uses an AgentScope-specific attribute because it is not yet defined by the GenAI
+ * convention.
+ *
+ * <p>Context propagation across Reactor's asynchronous chain is handled by
+ * {@link ContextPropagationOperator}. The first constructor call registers that
+ * operator once per JVM; operators assembled after registration are wrapped, while
+ * previously assembled chains are not.
+ *
  * <p>When no OTel SDK is configured (only the default no-op provider is
- * active), every hook short-circuits to {@code next.apply(input)} with
- * near-zero overhead.
+ * active), every hook short-circuits with near-zero overhead.
+ *
+ * <p>The no-argument constructor reads {@link GlobalOpenTelemetry} lazily when a hook runs.
+ * Pass an application-owned SDK to {@link #OtelTracingMiddleware(OpenTelemetry)} when spans must
+ * be recorded on that SDK instead. The caller owns that SDK's lifecycle; the global SDK is not
+ * replaced.
  *
  * <p>Usage:
  * <pre>{@code
@@ -64,12 +85,74 @@ public class OtelTracingMiddleware implements MiddlewareBase {
 
     private static final String INSTRUMENTATION_NAME = "io.agentscope";
 
-    private Tracer getTracer() {
-        return GlobalOpenTelemetry.getTracer(INSTRUMENTATION_NAME);
+    private static final String GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens";
+    private static final String GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens";
+    private static final String GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS =
+            "gen_ai.usage.cache_creation.input_tokens";
+    private static final String GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS =
+            "gen_ai.usage.cache_read.input_tokens";
+    private static final String GEN_AI_USAGE_REASONING_OUTPUT_TOKENS =
+            "gen_ai.usage.reasoning.output_tokens";
+    private static final String AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS =
+            "agentscope.usage.tool_use_prompt_tokens";
+
+    private static volatile boolean hookRegistered = false;
+
+    private final OpenTelemetry openTelemetry;
+
+    private final Tracer tracer;
+
+    /**
+     * Creates middleware that reads {@link GlobalOpenTelemetry} lazily at hook execution, so the
+     * SDK may be registered after construction.
+     */
+    public OtelTracingMiddleware() {
+        this.openTelemetry = null;
+        this.tracer = null;
+        registerReactorHook();
     }
 
-    // Removed isTracingEnabled() — the OTel no-op provider already short-circuits
-    // with near-zero overhead, so an explicit check is unnecessary.
+    /**
+     * Creates middleware that records spans on an application-owned OpenTelemetry SDK.
+     *
+     * <p>The tracer is resolved once and reused. The SDK is not registered as {@link
+     * GlobalOpenTelemetry}, and its lifecycle is owned by the caller. This constructor still
+     * installs the JVM-wide Reactor hook.
+     *
+     * @param openTelemetry application-owned OpenTelemetry instance; must not be null
+     * @throws NullPointerException if {@code openTelemetry} is null
+     */
+    public OtelTracingMiddleware(OpenTelemetry openTelemetry) {
+        this.openTelemetry =
+                Objects.requireNonNull(openTelemetry, "openTelemetry must not be null");
+        this.tracer = this.openTelemetry.getTracer(INSTRUMENTATION_NAME);
+        registerReactorHook();
+    }
+
+    private static void registerReactorHook() {
+        if (!hookRegistered) {
+            synchronized (OtelTracingMiddleware.class) {
+                if (!hookRegistered) {
+                    ContextPropagationOperator.builder().build().registerOnEachOperator();
+                    hookRegistered = true;
+                }
+            }
+        }
+    }
+
+    /** Narrow declaration: subclasses overriding more hooks must extend this set. */
+    @Override
+    public Set<ExtensionPoint> activePoints() {
+        return EnumSet.of(
+                ExtensionPoint.ON_AGENT, ExtensionPoint.ON_MODEL_CALL, ExtensionPoint.ON_ACTING);
+    }
+
+    private Tracer getTracer() {
+        if (openTelemetry != null) {
+            return tracer;
+        }
+        return GlobalOpenTelemetry.getTracer(INSTRUMENTATION_NAME);
+    }
 
     // ------------------------------------------------------------------
     // onAgent — invoke_agent span
@@ -81,11 +164,13 @@ public class OtelTracingMiddleware implements MiddlewareBase {
             RuntimeContext ctx,
             AgentInput input,
             Function<AgentInput, Flux<AgentEvent>> next) {
-        return Flux.defer(
-                () -> {
-                    Tracer tracer = getTracer();
+        return Flux.deferContextual(
+                ctxView -> {
+                    Context parentContext = resolveOtelContext(ctxView);
                     Span span =
-                            tracer.spanBuilder("invoke_agent " + agent.getName())
+                            getTracer()
+                                    .spanBuilder("invoke_agent " + agent.getName())
+                                    .setParent(parentContext)
                                     .setAttribute("gen_ai.operation.name", "invoke_agent")
                                     .setAttribute("gen_ai.agent.name", agent.getName())
                                     .setAttribute(
@@ -96,30 +181,45 @@ public class OtelTracingMiddleware implements MiddlewareBase {
                                             (long) input.msgs().size())
                                     .startSpan();
 
-                    AtomicReference<String> replyIdRef = new AtomicReference<>();
+                    Context otelCtx = span.storeInContext(parentContext);
+                    AtomicReference<Boolean> ended = new AtomicReference<>(false);
 
-                    try (Scope ignored = span.makeCurrent()) {
-                        return next.apply(input)
-                                .doOnNext(
-                                        event -> {
-                                            if (event instanceof AgentStartEvent rse) {
-                                                replyIdRef.set(rse.getReplyId());
-                                            }
-                                        })
-                                .doOnComplete(
-                                        () -> {
-                                            setReplyIdIfPresent(span, replyIdRef.get());
-                                            span.setStatus(StatusCode.OK);
-                                            span.end();
-                                        })
-                                .doOnError(
-                                        e -> {
-                                            setReplyIdIfPresent(span, replyIdRef.get());
-                                            span.setStatus(StatusCode.ERROR, e.getMessage());
-                                            span.recordException(e);
-                                            span.end();
-                                        });
-                    }
+                    return ContextPropagationOperator.runWithContext(
+                            next.apply(input)
+                                    .doOnNext(
+                                            event -> {
+                                                if (event instanceof AgentStartEvent rse
+                                                        && rse.getSource() == null
+                                                        && rse.getReplyId() != null) {
+                                                    span.setAttribute(
+                                                            "agentscope.agent.reply_id",
+                                                            rse.getReplyId());
+                                                }
+                                            })
+                                    .doOnComplete(
+                                            () -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    span.setStatus(StatusCode.OK);
+                                                    span.end();
+                                                }
+                                            })
+                                    .doOnError(
+                                            e -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    span.setStatus(
+                                                            StatusCode.ERROR, e.getMessage());
+                                                    span.recordException(e);
+                                                    span.end();
+                                                }
+                                            })
+                                    .doOnCancel(
+                                            () -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    span.setStatus(StatusCode.ERROR, "cancelled");
+                                                    span.end();
+                                                }
+                                            }),
+                            otelCtx);
                 });
     }
 
@@ -133,14 +233,15 @@ public class OtelTracingMiddleware implements MiddlewareBase {
             RuntimeContext ctx,
             ModelCallInput input,
             Function<ModelCallInput, Flux<AgentEvent>> next) {
-        return Flux.defer(
-                () -> {
-                    Tracer tracer = getTracer();
+        return Flux.deferContextual(
+                ctxView -> {
+                    Context parentContext = resolveOtelContext(ctxView);
                     Model model = input.model();
-
                     String modelName = model != null ? model.getModelName() : "unknown";
                     Span span =
-                            tracer.spanBuilder("chat " + modelName)
+                            getTracer()
+                                    .spanBuilder("chat " + modelName)
+                                    .setParent(parentContext)
                                     .setAttribute("gen_ai.operation.name", "chat")
                                     .setAttribute("gen_ai.request.model", modelName)
                                     .setAttribute(
@@ -153,26 +254,41 @@ public class OtelTracingMiddleware implements MiddlewareBase {
                                                     : 0L)
                                     .startSpan();
 
-                    try (Scope ignored = span.makeCurrent()) {
-                        return next.apply(input)
-                                .doOnNext(
-                                        event -> {
-                                            if (event instanceof ModelCallEndEvent mce) {
-                                                setModelResponseAttributes(span, mce);
-                                            }
-                                        })
-                                .doOnComplete(
-                                        () -> {
-                                            span.setStatus(StatusCode.OK);
-                                            span.end();
-                                        })
-                                .doOnError(
-                                        e -> {
-                                            span.setStatus(StatusCode.ERROR, e.getMessage());
-                                            span.recordException(e);
-                                            span.end();
-                                        });
-                    }
+                    Context otelCtx = span.storeInContext(parentContext);
+                    AtomicReference<Boolean> ended = new AtomicReference<>(false);
+
+                    return ContextPropagationOperator.runWithContext(
+                            next.apply(input)
+                                    .doOnNext(
+                                            event -> {
+                                                if (event instanceof ModelCallEndEvent mce) {
+                                                    setModelResponseAttributes(span, mce);
+                                                }
+                                            })
+                                    .doOnComplete(
+                                            () -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    span.setStatus(StatusCode.OK);
+                                                    span.end();
+                                                }
+                                            })
+                                    .doOnError(
+                                            e -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    span.setStatus(
+                                                            StatusCode.ERROR, e.getMessage());
+                                                    span.recordException(e);
+                                                    span.end();
+                                                }
+                                            })
+                                    .doOnCancel(
+                                            () -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    span.setStatus(StatusCode.ERROR, "cancelled");
+                                                    span.end();
+                                                }
+                                            }),
+                            otelCtx);
                 });
     }
 
@@ -186,19 +302,21 @@ public class OtelTracingMiddleware implements MiddlewareBase {
             RuntimeContext ctx,
             ActingInput input,
             Function<ActingInput, Flux<AgentEvent>> next) {
-        return Flux.defer(
-                () -> {
-                    Tracer tracer = getTracer();
-
+        return Flux.deferContextual(
+                ctxView -> {
+                    Context parentContext = resolveOtelContext(ctxView);
                     String toolNames =
                             input.toolCalls() != null
                                     ? input.toolCalls().stream()
                                             .map(ToolUseBlock::getName)
                                             .collect(Collectors.joining(", "))
                                     : "unknown";
+                    String spanName = buildToolSpanName(input);
 
                     Span span =
-                            tracer.spanBuilder("execute_tool " + toolNames)
+                            getTracer()
+                                    .spanBuilder("execute_tool " + spanName)
+                                    .setParent(parentContext)
                                     .setAttribute("gen_ai.operation.name", "execute_tool")
                                     .setAttribute("gen_ai.tool.name", toolNames)
                                     .setAttribute(
@@ -208,30 +326,46 @@ public class OtelTracingMiddleware implements MiddlewareBase {
                                                     : 0L)
                                     .startSpan();
 
-                    try (Scope ignored = span.makeCurrent()) {
-                        return next.apply(input)
-                                .doOnNext(
-                                        event -> {
-                                            if (event instanceof ToolResultEndEvent tre) {
-                                                span.setAttribute(
-                                                        "gen_ai.tool.call.id",
-                                                        tre.getToolCallId() != null
-                                                                ? tre.getToolCallId()
-                                                                : "");
-                                            }
-                                        })
-                                .doOnComplete(
-                                        () -> {
-                                            span.setStatus(StatusCode.OK);
-                                            span.end();
-                                        })
-                                .doOnError(
-                                        e -> {
-                                            span.setStatus(StatusCode.ERROR, e.getMessage());
-                                            span.recordException(e);
-                                            span.end();
-                                        });
-                    }
+                    Context otelCtx = span.storeInContext(parentContext);
+                    AtomicReference<Boolean> ended = new AtomicReference<>(false);
+                    Set<String> callIds = ConcurrentHashMap.newKeySet();
+
+                    return ContextPropagationOperator.runWithContext(
+                            next.apply(input)
+                                    .doOnNext(
+                                            event -> {
+                                                if (event instanceof ToolResultEndEvent tre
+                                                        && tre.getToolCallId() != null) {
+                                                    callIds.add(tre.getToolCallId());
+                                                }
+                                            })
+                                    .doOnComplete(
+                                            () -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    setToolCallIds(span, callIds);
+                                                    span.setStatus(StatusCode.OK);
+                                                    span.end();
+                                                }
+                                            })
+                                    .doOnError(
+                                            e -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    setToolCallIds(span, callIds);
+                                                    span.setStatus(
+                                                            StatusCode.ERROR, e.getMessage());
+                                                    span.recordException(e);
+                                                    span.end();
+                                                }
+                                            })
+                                    .doOnCancel(
+                                            () -> {
+                                                if (ended.compareAndSet(false, true)) {
+                                                    setToolCallIds(span, callIds);
+                                                    span.setStatus(StatusCode.ERROR, "cancelled");
+                                                    span.end();
+                                                }
+                                            }),
+                            otelCtx);
                 });
     }
 
@@ -239,17 +373,45 @@ public class OtelTracingMiddleware implements MiddlewareBase {
     // helpers
     // ------------------------------------------------------------------
 
-    private void setReplyIdIfPresent(Span span, String replyId) {
-        if (replyId != null) {
-            span.setAttribute("agentscope.agent.reply_id", replyId);
+    // Reads OTel Context from Reactor ContextView first; falls back to ThreadLocal
+    // Context.current()
+    // so spans created inside a reactive pipeline can find their parent even after a thread hop.
+    private Context resolveOtelContext(ContextView ctxView) {
+        return ContextPropagationOperator.getOpenTelemetryContextFromContextView(
+                ctxView, Context.current());
+    }
+
+    // Uses the first tool name as the span name; appends "(+N more)" for batches to cap
+    // cardinality.
+    // Full tool name list is still available in the gen_ai.tool.name attribute.
+    private static String buildToolSpanName(ActingInput input) {
+        if (input.toolCalls() == null || input.toolCalls().isEmpty()) {
+            return "unknown";
+        }
+        String first = input.toolCalls().get(0).getName();
+        int rest = input.toolCalls().size() - 1;
+        return rest > 0 ? first + " (+" + rest + " more)" : first;
+    }
+
+    private void setToolCallIds(Span span, Set<String> callIds) {
+        if (!callIds.isEmpty()) {
+            span.setAttribute("gen_ai.tool.call.id", String.join(",", callIds));
         }
     }
 
     private void setModelResponseAttributes(Span span, ModelCallEndEvent event) {
         if (event.getUsage() != null) {
             var usage = event.getUsage();
-            span.setAttribute("gen_ai.usage.input_tokens", (long) usage.getInputTokens());
-            span.setAttribute("gen_ai.usage.output_tokens", (long) usage.getOutputTokens());
+            span.setAttribute(GEN_AI_USAGE_INPUT_TOKENS, (long) usage.getInputTokens());
+            span.setAttribute(GEN_AI_USAGE_OUTPUT_TOKENS, (long) usage.getOutputTokens());
+            span.setAttribute(
+                    GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
+                    (long) usage.getCacheCreationTokens());
+            span.setAttribute(GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS, (long) usage.getCachedTokens());
+            span.setAttribute(
+                    GEN_AI_USAGE_REASONING_OUTPUT_TOKENS, (long) usage.getReasoningTokens());
+            span.setAttribute(
+                    AGENTSCOPE_USAGE_TOOL_USE_PROMPT_TOKENS, (long) usage.getToolUsePromptTokens());
         }
     }
 }

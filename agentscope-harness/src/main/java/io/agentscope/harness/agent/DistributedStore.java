@@ -16,10 +16,15 @@
 package io.agentscope.harness.agent;
 
 import io.agentscope.core.state.AgentStateStore;
+import io.agentscope.harness.agent.bus.AsyncToolRegistry;
+import io.agentscope.harness.agent.bus.MessageBus;
 import io.agentscope.harness.agent.filesystem.remote.store.BaseStore;
+import io.agentscope.harness.agent.gateway.SessionTurnGate;
 import io.agentscope.harness.agent.sandbox.SandboxExecutionGuard;
 import io.agentscope.harness.agent.sandbox.snapshot.NoopSnapshotSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
+import io.agentscope.harness.agent.subagent.task.TaskRepository;
+import io.agentscope.harness.agent.team.TeamClient;
 import java.util.Objects;
 
 /**
@@ -56,9 +61,11 @@ import java.util.Objects;
  *
  * <p>Implementations are provided by extension modules:
  * <ul>
- *   <li>{@code agentscope-extensions-redis} — {@code RedisDistributedStore}</li>
+ *   <li>{@code agentscope-extensions-cos} — {@code CosDistributedStore}</li>
+ *   <li>{@code agentscope-extensions-jdbc} — {@code JdbcDistributedStore}</li>
+ *   <li>{@code agentscope-extensions-mongodb} — {@code MongoDistributedStore}</li>
  *   <li>{@code agentscope-extensions-oss} — {@code OssDistributedStore}</li>
- *   <li>{@code agentscope-extensions-mysql} — {@code MysqlDistributedStore}</li>
+ *   <li>{@code agentscope-extensions-redis} — {@code RedisDistributedStore}</li>
  * </ul>
  *
  * <p><b>Priority:</b> explicit builder methods ({@code .stateStore()}, {@code .filesystem()})
@@ -105,6 +112,73 @@ public interface DistributedStore {
     }
 
     /**
+     * Creates a {@link MessageBus} for inbox-based message delivery and session event streaming.
+     *
+     * <p>Override this when the store supports real-time transport (e.g. Redis Pub/Sub). The
+     * default returns {@code null}, which signals HarnessAgent to fall back to a workspace-backed
+     * implementation created from the resolved {@code AbstractFilesystem}.
+     *
+     * @return a message bus, or {@code null} to use the workspace default
+     */
+    default MessageBus messageBus() {
+        return null;
+    }
+
+    /**
+     * Creates an {@link AsyncToolRegistry} for tracking async tool executions.
+     *
+     * <p>Override this when the store supports persistent key-value storage. The default returns
+     * {@code null}, which signals HarnessAgent to fall back to a workspace-backed implementation.
+     *
+     * @return an async tool registry, or {@code null} to use the workspace default
+     */
+    default AsyncToolRegistry asyncToolRegistry() {
+        return null;
+    }
+
+    /**
+     * Creates a {@link TaskRepository} for distributed subagent background tasks.
+     *
+     * <p>Override this when the store supports hosted task persistence (e.g. control-plane
+     * {@code /api/v1/dp/tasks/*}). The default returns {@code null}, which signals HarnessAgent to
+     * fall back to a workspace-backed {@code WorkspaceTaskRepository}.
+     *
+     * @return a task repository, or {@code null} to use the workspace default
+     */
+    default TaskRepository taskRepository() {
+        return null;
+    }
+
+    /**
+     * Creates a {@link SessionTurnGate} for distributed per-session turn serialization.
+     *
+     * <p>Override this when the store supports hosted locks (e.g. control-plane
+     * {@code /api/v1/dp/locks/*}). The default returns {@code null}, which signals HarnessAgent to
+     * use the gateway's built-in {@link io.agentscope.harness.agent.gateway.LocalSessionTurnGate}.
+     *
+     * <p>When a distributed turn gate is used, configure {@link
+     * io.agentscope.core.ReActAgent} {@code conflictPolicy} to {@code FAIL} so concurrent state
+     * writes surface as errors rather than silent overwrites.
+     *
+     * @return a session turn gate, or {@code null} to use the process-local default
+     */
+    default SessionTurnGate sessionTurnGate() {
+        return null;
+    }
+
+    /**
+     * Creates a {@link TeamClient} for AgentTeams coordination.
+     *
+     * <p>Override when the store hosts team task/message APIs (control plane) or can back a local
+     * CAS client. The default returns {@code null}.
+     *
+     * @return a team client, or {@code null} when teams mode is unavailable
+     */
+    default TeamClient teamClient() {
+        return null;
+    }
+
+    /**
      * Creates a builder for composing a {@link DistributedStore} from individual components,
      * potentially sourced from different store implementations.
      *
@@ -136,6 +210,11 @@ public interface DistributedStore {
         private BaseStore baseStore;
         private SandboxSnapshotSpec sandboxSnapshotSpec;
         private SandboxExecutionGuard sandboxExecutionGuard;
+        private MessageBus messageBus;
+        private AsyncToolRegistry asyncToolRegistry;
+        private TaskRepository taskRepository;
+        private SessionTurnGate sessionTurnGate;
+        private TeamClient teamClient;
 
         private Builder() {}
 
@@ -183,6 +262,38 @@ public interface DistributedStore {
             return this;
         }
 
+        public Builder messageBus(MessageBus messageBus) {
+            this.messageBus = messageBus;
+            return this;
+        }
+
+        public Builder asyncToolRegistry(AsyncToolRegistry asyncToolRegistry) {
+            this.asyncToolRegistry = asyncToolRegistry;
+            return this;
+        }
+
+        public Builder taskRepository(TaskRepository taskRepository) {
+            this.taskRepository = taskRepository;
+            return this;
+        }
+
+        /**
+         * Sets the session turn gate for distributed per-session turn serialization.
+         *
+         * @param sessionTurnGate the turn gate to use
+         * @return this builder
+         */
+        public Builder sessionTurnGate(SessionTurnGate sessionTurnGate) {
+            this.sessionTurnGate = sessionTurnGate;
+            return this;
+        }
+
+        /** Sets the AgentTeams client. */
+        public Builder teamClient(TeamClient teamClient) {
+            this.teamClient = teamClient;
+            return this;
+        }
+
         /**
          * Builds the composite {@link DistributedStore}.
          *
@@ -198,7 +309,16 @@ public interface DistributedStore {
                     sandboxExecutionGuard != null
                             ? sandboxExecutionGuard
                             : SandboxExecutionGuard.noop();
-            return new CompositeDistributedStore(agentStateStore, baseStore, snap, guard);
+            return new CompositeDistributedStore(
+                    agentStateStore,
+                    baseStore,
+                    snap,
+                    guard,
+                    messageBus,
+                    asyncToolRegistry,
+                    taskRepository,
+                    sessionTurnGate,
+                    teamClient);
         }
     }
 
@@ -209,7 +329,12 @@ public interface DistributedStore {
             AgentStateStore stateStore,
             BaseStore store,
             SandboxSnapshotSpec snapshotSpec,
-            SandboxExecutionGuard executionGuard)
+            SandboxExecutionGuard executionGuard,
+            MessageBus bus,
+            AsyncToolRegistry toolRegistry,
+            TaskRepository tasks,
+            SessionTurnGate turnGate,
+            TeamClient teams)
             implements DistributedStore {
 
         @Override
@@ -230,6 +355,31 @@ public interface DistributedStore {
         @Override
         public SandboxExecutionGuard sandboxExecutionGuard() {
             return executionGuard;
+        }
+
+        @Override
+        public MessageBus messageBus() {
+            return bus;
+        }
+
+        @Override
+        public AsyncToolRegistry asyncToolRegistry() {
+            return toolRegistry;
+        }
+
+        @Override
+        public TaskRepository taskRepository() {
+            return tasks;
+        }
+
+        @Override
+        public SessionTurnGate sessionTurnGate() {
+            return turnGate;
+        }
+
+        @Override
+        public TeamClient teamClient() {
+            return teams;
         }
     }
 }

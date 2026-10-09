@@ -21,7 +21,6 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.ToolResultTextDeltaEvent;
-import io.agentscope.core.formatter.dashscope.DashScopeChatFormatter;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
@@ -30,13 +29,16 @@ import io.agentscope.core.middleware.ActingInput;
 import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ReasoningInput;
-import io.agentscope.core.model.DashScopeChatModel;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolEmitter;
 import io.agentscope.core.tool.ToolParam;
 import io.agentscope.core.tool.Toolkit;
+import io.agentscope.extensions.model.dashscope.DashScopeChatModel;
+import io.agentscope.extensions.model.dashscope.formatter.DashScopeChatFormatter;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.util.EnumSet;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import reactor.core.publisher.Flux;
@@ -133,6 +135,13 @@ public class CustomizedMiddlewareExample {
      * tool call start/end, and tool progress chunks.
      */
     static class MonitoringMiddleware implements MiddlewareBase {
+
+        /** Declares participation only at the overridden extension points. */
+        @Override
+        public Set<ExtensionPoint> activePoints() {
+            return EnumSet.of(
+                    ExtensionPoint.ON_AGENT, ExtensionPoint.ON_REASONING, ExtensionPoint.ON_ACTING);
+        }
 
         @Override
         public Flux<AgentEvent> onAgent(

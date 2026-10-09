@@ -19,7 +19,6 @@ import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.message.Msg;
-import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ReasoningInput;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
@@ -36,9 +35,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,7 +65,7 @@ import reactor.core.publisher.Flux;
  *       declarations override them too.
  * </ol>
  */
-public class DynamicSubagentsMiddleware implements MiddlewareBase {
+public class DynamicSubagentsMiddleware implements HarnessRuntimeMiddleware {
 
     private static final Logger log = LoggerFactory.getLogger(DynamicSubagentsMiddleware.class);
 
@@ -100,6 +101,12 @@ public class DynamicSubagentsMiddleware implements MiddlewareBase {
                         ? subagentTool
                         : new AgentSpawnTool(agentManager, taskRepository, 0);
         this.taskTool = new TaskTool(taskRepository);
+    }
+
+    /** Narrow declaration: subclasses overriding more hooks must extend this set. */
+    @Override
+    public Set<ExtensionPoint> activePoints() {
+        return EnumSet.of(ExtensionPoint.ON_REASONING);
     }
 
     /**
@@ -139,6 +146,10 @@ public class DynamicSubagentsMiddleware implements MiddlewareBase {
      */
     public List<Object> getTools() {
         return List.of(subagentTool, taskTool);
+    }
+
+    public TaskRepository getTaskRepository() {
+        return taskRepository;
     }
 
     @Override

@@ -15,6 +15,7 @@
  */
 package io.agentscope.harness.agent.filesystem.spec;
 
+import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.OverlayFilesystem;
 import io.agentscope.harness.agent.filesystem.ProjectAwareOverlay;
@@ -59,6 +60,8 @@ public class LocalFilesystemSpec {
      */
     private LocalFsMode mode = LocalFsMode.ROOTED;
 
+    private IsolationScope isolationScope;
+
     /**
      * User project root (lower layer of the resulting {@link OverlayFilesystem}). The agent reads
      * project-authored content (e.g. {@code AGENTS.md}, {@code knowledge/}, {@code skills/}) from
@@ -88,6 +91,23 @@ public class LocalFilesystemSpec {
      * land in the workspace.
      */
     private boolean projectWritable = false;
+
+    /**
+     * When {@code true}, the agent's file operations for non-routed paths resolve against the
+     * shared workspace root without the per-user namespace prefix. The host application and the
+     * agent then agree on physical locations: files written to the workspace root with plain
+     * {@code java.nio} (e.g. {@code uploads/}) are readable by {@code read_file} /
+     * {@code list_files}, and agent writes land where the host expects them.
+     *
+     * <p>Defaults to {@code false}, preserving the namespaced behaviour — the same read/write
+     * asymmetry as {@link RemoteFilesystemSpec#sharedLocalWorkspace(boolean)} (#3245).
+     *
+     * <p><b>Not safe for multi-tenant workspaces:</b> shared mode disables per-user namespace
+     * isolation at the workspace root — users/sessions configured on the same workspace
+     * directory will read and overwrite each other's files there. Intended for single-tenant
+     * host-app integrations.
+     */
+    private boolean sharedLocalWorkspace = false;
 
     /**
      * Sets the default command execution timeout in seconds.
@@ -171,6 +191,24 @@ public class LocalFilesystemSpec {
         }
         this.mode = mode;
         return this;
+    }
+
+    /**
+     * Sets the isolation scope controlling how file paths are namespaced per user, session, or
+     * agent. Defaults to {@link IsolationScope#USER} (consistent with
+     * {@link RemoteFilesystemSpec} and sandbox specs).
+     *
+     * @param scope isolation scope
+     * @return this spec
+     */
+    public LocalFilesystemSpec isolationScope(IsolationScope scope) {
+        this.isolationScope = scope;
+        return this;
+    }
+
+    /** Returns the configured isolation scope, or {@code null} to use the default. */
+    public IsolationScope getIsolationScope() {
+        return isolationScope;
     }
 
     /**
@@ -259,6 +297,19 @@ public class LocalFilesystemSpec {
         return mode;
     }
 
+    /**
+     * Enables or disables the shared workspace root for non-routed paths; see the field
+     * javadoc. When enabled, the per-user namespace prefix is not applied to the upper or
+     * project layers.
+     *
+     * @param shared whether non-routed paths resolve against the shared workspace root
+     * @return this spec
+     */
+    public LocalFilesystemSpec sharedLocalWorkspace(boolean shared) {
+        this.sharedLocalWorkspace = shared;
+        return this;
+    }
+
     /** Snapshot of configured extra roots. */
     public List<Path> getAdditionalRoots() {
         return List.copyOf(additionalRoots);
@@ -267,6 +318,10 @@ public class LocalFilesystemSpec {
     public AbstractFilesystem toFilesystem(Path workspace, NamespaceFactory localNamespaceFactory) {
         Path effectiveProject =
                 project != null ? project : Paths.get(System.getProperty("user.dir"));
+        // sharedLocalWorkspace: drop the per-user prefix so host-app writes at the workspace
+        // root and agent reads/writes agree on physical locations (#3245).
+        NamespaceFactory effectiveNamespaceFactory =
+                sharedLocalWorkspace ? null : localNamespaceFactory;
         List<Path> policyRoots = new ArrayList<>();
         policyRoots.add(effectiveProject);
         policyRoots.add(workspace);
@@ -281,15 +336,19 @@ public class LocalFilesystemSpec {
                         maxOutputBytes,
                         env.isEmpty() ? null : Map.copyOf(env),
                         inheritEnv,
-                        localNamespaceFactory,
+                        effectiveNamespaceFactory,
                         effectiveProject);
         LocalFilesystem lower = new LocalFilesystem(effectiveProject, true, 10, null);
         if (projectWritable) {
             LocalFilesystem projectFs =
                     new LocalFilesystem(
-                            effectiveProject, mode, pathPolicy, 10, localNamespaceFactory);
+                            effectiveProject, mode, pathPolicy, 10, effectiveNamespaceFactory);
             return new ProjectAwareOverlay(
-                    (AbstractSandboxFilesystem) upper, lower, projectFs, workspace);
+                    (AbstractSandboxFilesystem) upper,
+                    lower,
+                    projectFs,
+                    workspace,
+                    effectiveNamespaceFactory);
         }
         return OverlayFilesystem.of(upper, lower);
     }

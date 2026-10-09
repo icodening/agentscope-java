@@ -24,11 +24,10 @@ import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.util.JsonUtils;
-import io.agentscope.harness.agent.memory.session.SessionEntry;
-import io.agentscope.harness.agent.memory.session.SessionTree;
+import io.agentscope.harness.agent.context.ContextModelCalls;
+import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
-import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -155,7 +154,7 @@ public class MemoryFlushManager {
                         .content(TextBlock.builder().text(userPrompt.toString()).build())
                         .build());
 
-        return model.stream(flushInput, null, null)
+        return ContextModelCalls.auxiliary(model, flushInput)
                 .reduce(
                         new StringBuilder(),
                         (sb, chatResponse) -> {
@@ -182,106 +181,6 @@ public class MemoryFlushManager {
                             writeMemoryFiles(rc, extracted);
                             return Mono.empty();
                         });
-    }
-
-    /**
-     * Returns the string path of the session JSONL file where messages for the given agent and
-     * session are offloaded. Used by the compaction layer to embed the archive location in the
-     * summary message so the agent can retrieve full history if needed.
-     */
-    public String resolveOffloadPath(RuntimeContext rc, String agentId, String sessionId) {
-        try {
-            Path p = workspaceManager.resolveSessionContextFile(rc, agentId, sessionId);
-            return p != null ? p.toString() : "";
-        } catch (Exception e) {
-            log.debug(
-                    "Could not resolve offload path for agent={}, session={}: {}",
-                    agentId,
-                    sessionId,
-                    e.getMessage());
-            return "";
-        }
-    }
-
-    /**
-     * Offloads raw messages to the JSONL session tree.
-     */
-    public void offloadMessages(
-            RuntimeContext rc, List<Msg> messages, String agentId, String sessionId) {
-        offloadToSessionTree(rc, messages, agentId, sessionId);
-
-        log.debug(
-                "Offloaded {} messages for agent={}, session={}",
-                messages.size(),
-                agentId,
-                sessionId);
-        workspaceManager.updateSessionIndex(rc, agentId, sessionId, "conversation offloaded");
-    }
-
-    private void offloadToSessionTree(
-            RuntimeContext rc, List<Msg> messages, String agentId, String sessionId) {
-        try {
-            Path contextFile = workspaceManager.resolveSessionContextFile(rc, agentId, sessionId);
-            String contextRelPath =
-                    WorkspaceConstants.AGENTS_DIR
-                            + "/"
-                            + agentId
-                            + "/"
-                            + WorkspaceConstants.SESSIONS_DIR
-                            + "/"
-                            + sessionId
-                            + WorkspaceConstants.SESSION_CONTEXT_EXT;
-            SessionTree tree =
-                    new SessionTree(
-                                    contextFile,
-                                    workspaceManager.getWorkspace(),
-                                    workspaceManager.getFilesystem(),
-                                    workspaceManager.getIndex(),
-                                    contextRelPath)
-                            .setRuntimeContext(rc);
-            tree.load();
-            // Sync from remote before appending so that entries written by a previous replica
-            // (cross-machine handoff) are included in the merged file pushed to remote.
-            tree.syncFromRemote();
-
-            String lastId = null;
-            for (Msg msg : messages) {
-                if (msg.getRole() == null || isSessionContextMessage(msg)) {
-                    continue;
-                }
-                String rendered = renderContentBlocks(msg);
-                if (rendered == null || rendered.isBlank()) {
-                    continue;
-                }
-                String toolCallId = extractToolCallId(msg);
-                SessionEntry.MessageEntry entry =
-                        new SessionEntry.MessageEntry(
-                                null, lastId, null, msg.getRole().name(), rendered, toolCallId);
-                tree.append(entry);
-                lastId = entry.getId();
-            }
-
-            tree.flush();
-        } catch (Exception e) {
-            log.warn("Failed to offload to JSONL session tree: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Extracts a representative tool call ID from a message, if present.
-     * For TOOL messages, returns the first ToolResultBlock's id.
-     * For ASSISTANT messages with tool calls, returns the first ToolUseBlock's id.
-     */
-    private static String extractToolCallId(Msg msg) {
-        for (ContentBlock block : msg.getContent()) {
-            if (block instanceof ToolResultBlock tr && tr.getId() != null) {
-                return tr.getId();
-            }
-            if (block instanceof ToolUseBlock tu && tu.getId() != null) {
-                return tu.getId();
-            }
-        }
-        return null;
     }
 
     /**
@@ -319,16 +218,24 @@ public class MemoryFlushManager {
      * Serializes all messages into a textual representation for the memory extraction model.
      * Includes USER, ASSISTANT, and TOOL messages. Assistant tool-call blocks and tool-result
      * blocks are rendered as concise text so the model can extract memories from tool interactions.
-     * The injected {@code <session_context>} user message is skipped as it contains only
-     * environment metadata, not real conversation content.
+     * Internal context messages are skipped because they are generated from existing context,
+     * not new user/assistant/tool facts.
      */
     private String serializeMessages(List<Msg> messages) {
         return messages.stream()
                 .filter(m -> m.getRole() != null && m.getRole() != MsgRole.SYSTEM)
-                .filter(m -> !isSessionContextMessage(m))
+                .filter(m -> !isInternalContextMessage(m))
                 .map(this::renderMessage)
                 .filter(s -> s != null && !s.isBlank())
                 .collect(Collectors.joining("\n"));
+    }
+
+    private static boolean isInternalContextMessage(Msg msg) {
+        return isSessionContextMessage(msg) || isCompactionSummaryMessage(msg);
+    }
+
+    private static boolean isCompactionSummaryMessage(Msg msg) {
+        return msg != null && ConversationCompactor.SUMMARY_MSG_NAME.equals(msg.getName());
     }
 
     private static boolean isSessionContextMessage(Msg msg) {

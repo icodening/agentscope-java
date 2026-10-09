@@ -63,6 +63,11 @@ import java.util.Map;
  */
 public class CompositeFilesystem implements AbstractFilesystem {
 
+    @Override
+    public io.agentscope.core.session.AtomicSessionStorage sessionStorage(RuntimeContext rc) {
+        return routeForPath("agents/").backend().sessionStorage(rc);
+    }
+
     private final AbstractFilesystem defaultBackend;
     private final List<RouteEntry> sortedRoutes;
 
@@ -96,6 +101,14 @@ public class CompositeFilesystem implements AbstractFilesystem {
 
     private record RouteResult(
             AbstractFilesystem backend, String backendPath, String routePrefix) {}
+
+    /**
+     * Returns the backend filesystem that would serve {@code path}: the longest matching prefix
+     * route, or the default backend when no route matches.
+     */
+    public AbstractFilesystem filesystemFor(String path) {
+        return routeForPath(path).backend();
+    }
 
     private RouteResult routeForPath(String path) {
         // Canonicalize both sides by stripping any leading slash before matching so callers can
@@ -188,9 +201,9 @@ public class CompositeFilesystem implements AbstractFilesystem {
             return LsResult.success(remapped);
         }
 
-        if ("/".equals(path)) {
+        if ("/".equals(path) || ".".equals(path)) {
             List<FileInfo> results = new ArrayList<>();
-            LsResult defaultResult = defaultBackend.ls(runtimeContext, path);
+            LsResult defaultResult = defaultBackend.ls(runtimeContext, "/");
             if (defaultResult.isSuccess() && defaultResult.entries() != null) {
                 results.addAll(defaultResult.entries());
             }
@@ -269,7 +282,7 @@ public class CompositeFilesystem implements AbstractFilesystem {
             }
         }
 
-        if (path == null || "/".equals(path)) {
+        if (path == null || "/".equals(path) || ".".equals(path)) {
             List<GrepMatch> allMatches = new ArrayList<>();
             GrepResult defaultResult = defaultBackend.grep(runtimeContext, pattern, path, glob);
             if (!defaultResult.isSuccess()) {
@@ -332,7 +345,7 @@ public class CompositeFilesystem implements AbstractFilesystem {
 
         // Non-root path that didn't match any route: delegate to default backend only.
         // Route scanning only makes sense for root-level recursive globs.
-        if (path != null && !"/".equals(path)) {
+        if (path != null && !"/".equals(path) && !".".equals(path)) {
             return defaultBackend.glob(runtimeContext, pattern, path);
         }
 

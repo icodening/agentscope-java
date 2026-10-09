@@ -23,7 +23,6 @@ import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.middleware.AgentInput;
-import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ReasoningInput;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.subagent.AgentSpecLoader;
@@ -44,8 +43,10 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -73,7 +74,7 @@ import reactor.core.publisher.Flux;
  *       accumulates across iterations.
  * </ol>
  */
-public class SubagentsMiddleware implements MiddlewareBase {
+public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
 
     private static final Logger log = LoggerFactory.getLogger(SubagentsMiddleware.class);
 
@@ -119,8 +120,13 @@ public class SubagentsMiddleware implements MiddlewareBase {
 
             **`task_output`** — Retrieve the result of a background task by task_id.
             - **You rarely need this.** Completed tasks are pushed back to you automatically as a `<system-reminder>` block before your next reasoning step.
-            - Use `task_output(block=false)` only when you need the full result and the pushed summary was truncated, or to inspect a specific task on demand.
-            - Avoid `block=true`; it serialises the conversation behind the task.
+            - Use `task_output(block=false)` when you need a specific task's latest status/result, the pushed summary was truncated, or you intentionally want to check progress while continuing other reasoning.
+            - Use `task_output(block=true)` only for one specific task you are ready to wait for; for multiple tasks use `wait_async_results`.
+
+            **`wait_async_results`** — Wait for background-task results when the next step depends on them.
+            - Prefer `wait_async_results(task_ids=...)`: waits until those tasks are terminal and **returns their results in the tool output**.
+            - Prefer `wait_async_results(wait_all=true)`: waits for the snapshot of currently non-terminal background tasks (tasks started later are not added) and **returns their results**.
+            - Without `task_ids` and without `wait_all`: legacy **inbox-any** mode — returns when ANY inbox message arrives. This is NOT wait-all; use `task_ids` / `wait_all=true` when every task in a group must finish.
 
             **`task_cancel`** — Cancel a running background task by task_id. No effect on already-completed tasks.
 
@@ -128,8 +134,12 @@ public class SubagentsMiddleware implements MiddlewareBase {
 
             ### Background task flow
             1. Spawn with `timeout_seconds=0` to fire-and-forget; the response gives you a task_id.
-            2. **Do not poll.** Continue with other work; when the task finishes you'll see a `<system-reminder>` containing its result.
-            3. If the agent has nothing useful to do, hand control back to the user — they'll prompt again when ready and the next reasoning round will surface any completions.
+            2. Continue with independent work. If you need fresh state, use `task_output(block=false)` for selected tasks.
+            3. If a later step must wait for a known group, call `wait_async_results(task_ids=...)`; if it must wait for every current background task, call `wait_async_results(wait_all=true)`.
+            4. If the agent has nothing useful to do, hand control back to the user — they'll prompt again when ready and the next reasoning round will surface any completions.
+
+            ### Timeout promotion
+            When a sync spawn/send exceeds its timeout, the task is **not lost** — it is automatically promoted to a background task. You receive `status: timeout_promoted` with a `task_id`. Treat it like any async task: the result will be pushed back to you automatically as a `<system-reminder>`. Do NOT retry the same task — it is already running in the background.
 
             ### Available agent ids
             %s
@@ -154,8 +164,10 @@ public class SubagentsMiddleware implements MiddlewareBase {
             4. **Reconcile** → Incorporate or synthesize the result into the main thread
 
             ### Usage patterns
-            - **Parallel execution**: Launch multiple subagents concurrently with timeout_seconds=0 when tasks are independent, then collect results with task_output(block=false) after a delay
-            - **Sync delegation**: Use default timeout for simple one-shot delegation
+            - **Parallel async execution**: Split work by independence/dependency. Launch independent, non-conflicting tasks with `timeout_seconds=0`; continue reasoning, then use `task_output(block=false)` for selective progress checks or `wait_async_results(task_ids=...)` / `wait_async_results(wait_all=true)` when a barrier is required
+            - **Parallel sync delegation**: Multiple sync `agent_spawn` / `agent_send` calls in one turn run concurrently by default (Toolkit parallel=true); the parent waits for that batch of tool results before continuing. Pass a Toolkit with parallel=false to opt out.
+            - **Mixed short/long work**: Wait for short prerequisite tasks first, continue reasoning with those results, and merge long-running async results later through `task_output` or `wait_async_results`
+            - **Sync delegation**: Use default timeout for simple one-shot delegation when one result is needed before the next reasoning step
             - **Persistent session**: Spawn without a task, then use send for multi-turn interaction
             - **Cancel stale work**: Use task_cancel to stop background tasks that are no longer needed
             - Subagent results are NOT visible to the user — always summarize them in your response
@@ -163,7 +175,6 @@ public class SubagentsMiddleware implements MiddlewareBase {
     // @formatter:on
 
     private final List<SubagentEntry> baseEntries;
-    private volatile List<SubagentEntry> entries;
     private volatile Object subagentTool;
     private final TaskTool taskTool;
     private final TaskRepository taskRepository;
@@ -173,6 +184,10 @@ public class SubagentsMiddleware implements MiddlewareBase {
     private final Path mainWorkspace;
     private final Function<SubagentDeclaration, SubagentFactory> factoryBuilder;
     private final DefaultAgentManager agentManager;
+    private final WorkspaceManager workspaceManager;
+
+    private record SubagentSnapshot(
+            List<SubagentEntry> entries, DefaultAgentManager agentManager) {}
 
     /**
      * Optional {@link AgentGenerateTool} for LLM-driven subagent spec generation. Lazy because
@@ -192,10 +207,10 @@ public class SubagentsMiddleware implements MiddlewareBase {
             Path mainWorkspace,
             Function<SubagentDeclaration, SubagentFactory> factoryBuilder) {
         this.baseEntries = List.copyOf(entries);
-        this.entries = this.baseEntries;
         this.isSessionMode = false;
         DefaultAgentManager dam = new DefaultAgentManager(entries, workspaceManager);
         this.agentManager = dam;
+        this.workspaceManager = workspaceManager;
         java.util.Objects.requireNonNull(taskRepository, "taskRepository");
         this.taskRepository = taskRepository;
         this.subagentTool = new AgentSpawnTool(dam, taskRepository, 0);
@@ -223,9 +238,9 @@ public class SubagentsMiddleware implements MiddlewareBase {
             Object externalSubagentTool,
             TaskRepository taskRepository) {
         this.baseEntries = List.copyOf(entries);
-        this.entries = this.baseEntries;
         this.isSessionMode = true;
         this.agentManager = null;
+        this.workspaceManager = null;
         this.subagentTool = externalSubagentTool;
         java.util.Objects.requireNonNull(taskRepository, "taskRepository");
         this.taskRepository = taskRepository;
@@ -233,6 +248,12 @@ public class SubagentsMiddleware implements MiddlewareBase {
         this.filesystem = null;
         this.mainWorkspace = null;
         this.factoryBuilder = null;
+    }
+
+    /** Narrow declaration: subclasses overriding more hooks must extend this set. */
+    @Override
+    public Set<ExtensionPoint> activePoints() {
+        return EnumSet.of(ExtensionPoint.ON_AGENT, ExtensionPoint.ON_REASONING);
     }
 
     /**
@@ -253,6 +274,72 @@ public class SubagentsMiddleware implements MiddlewareBase {
             return this;
         }
         this.agentGenerateTool = new AgentGenerateTool(generator, agentManager, filesystem);
+        return this;
+    }
+
+    /** Returns the {@link TaskRepository} used by this middleware. */
+    public TaskRepository getTaskRepository() {
+        return taskRepository;
+    }
+
+    /**
+     * Wires a {@link io.agentscope.harness.agent.bus.MessageBus} so that background task completions are
+     * pushed to the session inbox and a wakeup signal is enqueued. This enables the
+     * {@link io.agentscope.harness.agent.gateway.WakeupDispatcher} to re-trigger idle sessions
+     * when subagent work finishes.
+     *
+     * <p>Registers a {@link TaskRepository.TaskCompletionCallback} on the underlying repository.
+     * Safe to call multiple times — each call replaces the previous callback.
+     *
+     * @param messageBus the application message bus
+     * @param agentId the parent agent id (for wakeup routing)
+     * @return this middleware for chaining
+     */
+    public SubagentsMiddleware wireMessageBus(
+            io.agentscope.harness.agent.bus.MessageBus messageBus, String agentId) {
+        if (messageBus == null) {
+            return this;
+        }
+        taskRepository.setCompletionCallback(
+                (rc, taskId, subAgentId, sessionId, result) -> {
+                    String userId = rc != null ? rc.getUserId() : null;
+                    String hintContent =
+                            String.format(
+                                    "<system-notification>Background subagent task '%s'"
+                                            + " (agent=%s) has completed.\n\nResult:\n\n%s"
+                                            + "</system-notification>",
+                                    taskId, subAgentId, result != null ? result : "(no output)");
+                    String hintId = java.util.UUID.randomUUID().toString().replace("-", "");
+                    java.util.Map<String, Object> hintPayload =
+                            java.util.Map.of(
+                                    "type",
+                                    "hint",
+                                    "id",
+                                    hintId,
+                                    "hint",
+                                    hintContent,
+                                    "source",
+                                    "subagent_task");
+                    messageBus.inboxPush(sessionId, hintPayload).subscribe();
+                    messageBus
+                            .enqueueWakeup(
+                                    userId != null ? userId : "",
+                                    sessionId,
+                                    agentId != null ? agentId : "")
+                            .subscribe(
+                                    unused -> {},
+                                    err ->
+                                            log.warn(
+                                                    "Failed to enqueue wakeup after task {}"
+                                                            + " completion: {}",
+                                                    taskId,
+                                                    err.getMessage()));
+                    log.info(
+                            "Subagent task {} completed, pushed to inbox and enqueued wakeup:"
+                                    + " session={}",
+                            taskId,
+                            sessionId);
+                });
         return this;
     }
 
@@ -299,7 +386,7 @@ public class SubagentsMiddleware implements MiddlewareBase {
      * contains an {@link AgentGenerateTool}.
      */
     public List<Object> getTools() {
-        if (entries.isEmpty()) {
+        if (baseEntries.isEmpty()) {
             return List.of();
         }
         AgentGenerateTool gen = this.agentGenerateTool;
@@ -315,7 +402,9 @@ public class SubagentsMiddleware implements MiddlewareBase {
             RuntimeContext ctx,
             AgentInput input,
             Function<AgentInput, Flux<AgentEvent>> next) {
-        reloadSubagentEntries();
+        if (ctx != null) {
+            installSnapshot(ctx, loadSubagentSnapshot(ctx));
+        }
         return next.apply(input);
     }
 
@@ -325,11 +414,8 @@ public class SubagentsMiddleware implements MiddlewareBase {
             RuntimeContext ctx,
             ReasoningInput input,
             Function<ReasoningInput, Flux<AgentEvent>> next) {
-        List<SubagentEntry> currentEntries = this.entries;
-        if (currentEntries.isEmpty()) {
-            return next.apply(input);
-        }
         RuntimeContext rc = ctx != null ? ctx : RuntimeContext.empty();
+        List<SubagentEntry> currentEntries = snapshotFor(rc).entries();
         String sessionId = rc != null ? rc.getSessionId() : null;
 
         // ---- Phase B-3 push delivery -------------------------------------------------------
@@ -338,8 +424,10 @@ public class SubagentsMiddleware implements MiddlewareBase {
         // the legacy pull-only flow unchanged.
         List<TaskDelivery> pending = this.taskRepository.findPendingDeliveries(rc, sessionId);
         Msg deliveryMsg = null;
-        if (!pending.isEmpty() && agent instanceof ReActAgent reAct) {
+        if (!pending.isEmpty()) {
             deliveryMsg = buildDeliveryReminder(pending);
+        }
+        if (deliveryMsg != null && agent instanceof ReActAgent reAct) {
             try {
                 RuntimeContext.resolveAgentState(rc, reAct).contextMutable().add(deliveryMsg);
             } catch (RuntimeException e) {
@@ -379,7 +467,12 @@ public class SubagentsMiddleware implements MiddlewareBase {
             downstream =
                     downstream.doOnComplete(
                             () -> {
-                                for (TaskDelivery d : pending) {
+                                for (TaskDelivery d :
+                                        pending.subList(
+                                                0,
+                                                Math.min(
+                                                        pending.size(),
+                                                        MAX_DELIVERIES_PER_REMINDER))) {
                                     try {
                                         repoRef.markDelivered(rcRef, sidRef, d.taskId());
                                     } catch (RuntimeException e) {
@@ -510,13 +603,28 @@ public class SubagentsMiddleware implements MiddlewareBase {
         return out;
     }
 
-    private void reloadSubagentEntries() {
+    private SubagentSnapshot snapshotFor(RuntimeContext runtimeContext) {
+        SubagentSnapshot existing = runtimeContext.get(SubagentSnapshot.class);
+        if (existing != null) {
+            return existing;
+        }
+        SubagentSnapshot snapshot = loadSubagentSnapshot(runtimeContext);
+        installSnapshot(runtimeContext, snapshot);
+        return snapshot;
+    }
+
+    private void installSnapshot(RuntimeContext runtimeContext, SubagentSnapshot snapshot) {
+        runtimeContext.put(SubagentSnapshot.class, snapshot);
+        runtimeContext.put(AgentSpawnTool.CTX_AGENT_MANAGER, snapshot.agentManager());
+    }
+
+    private SubagentSnapshot loadSubagentSnapshot(RuntimeContext runtimeContext) {
         if (filesystem == null || factoryBuilder == null || isSessionMode) {
-            return;
+            return new SubagentSnapshot(baseEntries, agentManager);
         }
         try {
             List<SubagentDeclaration> decls =
-                    AgentSpecLoader.loadFromFilesystem(filesystem, mainWorkspace);
+                    AgentSpecLoader.loadFromFilesystem(filesystem, runtimeContext, mainWorkspace);
 
             List<SubagentEntry> newEntries = new ArrayList<>(baseEntries);
             for (SubagentDeclaration decl : decls) {
@@ -531,13 +639,12 @@ public class SubagentsMiddleware implements MiddlewareBase {
                                     decl));
                 }
             }
-
-            this.entries = List.copyOf(newEntries);
-            if (agentManager != null) {
-                agentManager.refreshEntries(this.entries);
-            }
+            List<SubagentEntry> snapshotEntries = List.copyOf(newEntries);
+            return new SubagentSnapshot(
+                    snapshotEntries, new DefaultAgentManager(snapshotEntries, workspaceManager));
         } catch (Exception e) {
             log.warn("Failed to reload subagent entries from filesystem: {}", e.getMessage());
+            return new SubagentSnapshot(baseEntries, agentManager);
         }
     }
 

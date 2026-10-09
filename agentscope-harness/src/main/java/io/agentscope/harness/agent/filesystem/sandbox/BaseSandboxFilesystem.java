@@ -73,22 +73,55 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
     public LsResult ls(RuntimeContext runtimeContext, String path) {
         String escapedPath = FilesystemUtils.shellQuote(path);
         String cmd =
-                "for f in "
+                "if [ ! -e "
+                        + escapedPath
+                        + " ]; then echo '__NOT_EXISTS__'; "
+                        + "elif [ ! -d "
+                        + escapedPath
+                        + " ]; then echo '__NOT_A_DIR__'; "
+                        + "else for f in "
                         + escapedPath
                         + "/*; do "
-                        + "  if [ -d \"$f\" ]; then echo \"DIR:$f\"; "
-                        + "  elif [ -f \"$f\" ]; then echo \"FILE:$f\"; fi; "
-                        + "done 2>/dev/null";
+                        + "  if [ -d \"$f\" ]; then "
+                        + "    mtime=$(stat -c '%Y' \"$f\" 2>/dev/null || echo 0); "
+                        + "    printf 'DIR:%s\\t%s\\n' \"$f\" \"$mtime\"; "
+                        + "  elif [ -f \"$f\" ]; then "
+                        + "    size=$(stat -c '%s' \"$f\" 2>/dev/null || echo 0); "
+                        + "    mtime=$(stat -c '%Y' \"$f\" 2>/dev/null || echo 0); "
+                        + "    printf 'FILE:%s\\t%s\\t%s\\n' \"$f\" \"$size\" \"$mtime\"; "
+                        + "  fi; "
+                        + "done; fi";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return LsResult.fail(executeFailureMessage(result, "listing", path));
+        }
+        String output = result.output() != null ? result.output().strip() : "";
+
+        if ("__NOT_EXISTS__".equals(output)) {
+            return LsResult.fail("Path does not exist: " + path);
+        }
+        if ("__NOT_A_DIR__".equals(output)) {
+            return LsResult.fail("Not a directory: " + path);
+        }
+
         List<FileInfo> entries = new ArrayList<>();
 
-        if (result.output() != null && !result.output().isBlank()) {
-            for (String line : result.output().strip().split("\n")) {
+        if (!output.isBlank()) {
+            for (String line : output.split("\n")) {
                 if (line.startsWith("DIR:")) {
-                    entries.add(FileInfo.ofDir(line.substring(4), ""));
+                    String payload = line.substring(4);
+                    String[] parts = payload.split("\t", 2);
+                    String dirPath = parts[0];
+                    long mtimeMs = parts.length > 1 ? parseEpochSeconds(parts[1]) : 0L;
+                    entries.add(FileInfo.ofDir(dirPath, mtimeMs));
                 } else if (line.startsWith("FILE:")) {
-                    entries.add(FileInfo.ofFile(line.substring(5), 0, ""));
+                    String payload = line.substring(5);
+                    String[] parts = payload.split("\t", 3);
+                    String filePath = parts[0];
+                    long size = parts.length > 1 ? parseLongSafe(parts[1]) : 0L;
+                    long mtimeMs = parts.length > 2 ? parseEpochSeconds(parts[2]) : 0L;
+                    entries.add(FileInfo.ofFile(filePath, size, mtimeMs));
                 }
             }
         }
@@ -104,8 +137,18 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         if (!"text".equals(fileType)) {
             String cmd = "base64 " + escapedPath + " 2>/dev/null";
             ExecuteResponse result = execute(runtimeContext, cmd, null);
-            if (result.exitCode() != null && result.exitCode() != 0) {
-                return ReadResult.fail("File '" + filePath + "': file_not_found");
+            if (!result.isSuccess()) {
+                // Positive exit codes other than 124 (the timeout(1) convention — the command
+                // did not complete) mean the command ran and base64 could not read the file;
+                // stderr is discarded, so report the designed file_not_found signal instead of
+                // an empty error.
+                boolean commandRanAndFailedToRead =
+                        result.exitCode() != null
+                                && result.exitCode() > 0
+                                && result.exitCode() != 124;
+                return commandRanAndFailedToRead
+                        ? ReadResult.fail("File '" + filePath + "': file_not_found")
+                        : ReadResult.fail(executeFailureMessage(result, "reading", filePath));
             }
             String encoded = result.output() != null ? result.output().strip() : "";
             return ReadResult.success(new FileData(encoded, "base64"));
@@ -129,6 +172,9 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         + "; fi";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return ReadResult.fail(executeFailureMessage(result, "reading", filePath));
+        }
         String output = result.output() != null ? result.output() : "";
 
         if (output.strip().equals("__NOT_FOUND__")) {
@@ -209,32 +255,42 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                 Base64.getEncoder()
                         .encodeToString(payload.getBytes(java.nio.charset.StandardCharsets.UTF_8));
 
+        // The program must be delimited by real line feeds: inside a POSIX double-quoted
+        // string a literal backslash-n sequence reaches python3 unchanged, which collapses
+        // the program into a single line and fails with a SyntaxError (#2571).
+        String pythonProgram =
+                """
+                import sys, os, base64, json
+                payload = json.loads(base64.b64decode(sys.stdin.read().strip()).decode('utf-8'))
+                path, old, new = payload['path'], payload['old'], payload['new']
+                replace_all = payload.get('replace_all', False)
+                if not os.path.isfile(path):
+                    print(json.dumps({'error': 'file_not_found'}))
+                    sys.exit(0)
+                with open(path, 'rb') as f: text = f.read().decode('utf-8')
+                count = text.count(old)
+                if count == 0:
+                    print(json.dumps({'error': 'string_not_found'}))
+                    sys.exit(0)
+                if count > 1 and not replace_all:
+                    print(json.dumps({'error': 'multiple_occurrences', 'count': count}))
+                    sys.exit(0)
+                result = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+                with open(path, 'wb') as f: f.write(result.encode('utf-8'))
+                print(json.dumps({'count': count}))
+                """;
+
         String cmd =
-                "python3 -c \"import sys, os, base64, json\\n"
-                    + "payload ="
-                    + " json.loads(base64.b64decode(sys.stdin.read().strip()).decode('utf-8'))\\n"
-                    + "path, old, new = payload['path'], payload['old'], payload['new']\\n"
-                    + "replace_all = payload.get('replace_all', False)\\n"
-                    + "if not os.path.isfile(path):\\n"
-                    + "    print(json.dumps({'error': 'file_not_found'}))\\n"
-                    + "    sys.exit(0)\\n"
-                    + "with open(path, 'rb') as f: text = f.read().decode('utf-8')\\n"
-                    + "count = text.count(old)\\n"
-                    + "if count == 0:\\n"
-                    + "    print(json.dumps({'error': 'string_not_found'}))\\n"
-                    + "    sys.exit(0)\\n"
-                    + "if count > 1 and not replace_all:\\n"
-                    + "    print(json.dumps({'error': 'multiple_occurrences', 'count': count}))\\n"
-                    + "    sys.exit(0)\\n"
-                    + "result = text.replace(old, new) if replace_all else text.replace(old, new,"
-                    + " 1)\\n"
-                    + "with open(path, 'wb') as f: f.write(result.encode('utf-8'))\\n"
-                    + "print(json.dumps({'count': count}))\\n"
-                    + "\" 2>&1 <<'__EDIT_EOF__'\n"
+                "python3 -c \""
+                        + pythonProgram
+                        + "\" 2>&1 <<'__EDIT_EOF__'\n"
                         + payloadB64
                         + "\n__EDIT_EOF__\n";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return EditResult.fail(executeFailureMessage(result, "editing", filePath));
+        }
         String output = result.output() != null ? result.output().strip() : "";
 
         if (output.contains("\"error\"")) {
@@ -295,6 +351,10 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
                         + " 2>/dev/null || true";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return GrepResult.fail(
+                    executeFailureMessage(result, "searching", path != null ? path : "."));
+        }
         String output = result.output() != null ? result.output().strip() : "";
 
         if (output.isEmpty()) {
@@ -322,9 +382,21 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
         String escapedPattern = FilesystemUtils.shellQuote(stripRecursivePrefix(pattern));
 
         String cmd =
-                "find " + escapedPath + " -type f -name " + escapedPattern + " 2>/dev/null | sort";
+                "find "
+                        + escapedPath
+                        + " -type f -name "
+                        + escapedPattern
+                        + " 2>/dev/null | sort | while IFS= read -r f; do "
+                        + "  size=$(stat -c '%s' \"$f\" 2>/dev/null || echo 0); "
+                        + "  mtime=$(stat -c '%Y' \"$f\" 2>/dev/null || echo 0); "
+                        + "  printf '%s\\t%s\\t%s\\n' \"$f\" \"$size\" \"$mtime\"; "
+                        + "done";
 
         ExecuteResponse result = execute(runtimeContext, cmd, null);
+        if (!result.isSuccess()) {
+            return GlobResult.fail(
+                    executeFailureMessage(result, "globbing", path != null ? path : "/"));
+        }
         String output = result.output() != null ? result.output().strip() : "";
 
         if (output.isEmpty()) {
@@ -333,7 +405,16 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
 
         List<FileInfo> entries = new ArrayList<>();
         for (String line : output.split("\n")) {
-            if (!line.isBlank()) {
+            if (line.isBlank()) {
+                continue;
+            }
+            String[] parts = line.split("\t", 3);
+            if (parts.length >= 3) {
+                String filePath = parts[0].trim();
+                long size = parseLongSafe(parts[1]);
+                long mtimeMs = parseEpochSeconds(parts[2]);
+                entries.add(FileInfo.ofFile(filePath, size, mtimeMs));
+            } else {
                 entries.add(FileInfo.ofFile(line.trim(), 0, ""));
             }
         }
@@ -380,6 +461,20 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
     }
 
     /**
+     * Builds the failure message for a non-successful {@link #execute} response, prefixing the
+     * operation context and falling back to the exit code when the response carries no
+     * diagnostic output.
+     */
+    private static String executeFailureMessage(
+            ExecuteResponse result, String operation, String target) {
+        String detail =
+                result.output() != null && !result.output().isBlank()
+                        ? result.output()
+                        : "exit code " + result.exitCode();
+        return "Error " + operation + " '" + target + "': " + detail;
+    }
+
+    /**
      * Strips the recursive glob prefix {@code **&#47;} from a pattern so it can be passed to
      * tools like {@code find -name} or {@code grep --include=} that match only the filename
      * portion. For example, {@code **&#47;*.java} becomes {@code *.java}.
@@ -392,6 +487,19 @@ public abstract class BaseSandboxFilesystem implements AbstractSandboxFilesystem
             return pattern.substring(3);
         }
         return pattern;
+    }
+
+    private static long parseLongSafe(String s) {
+        try {
+            return Long.parseLong(s.trim());
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
+    }
+
+    private static long parseEpochSeconds(String s) {
+        long epochSec = parseLongSafe(s);
+        return epochSec * 1000;
     }
 
     private static String jsonEscape(String s) {

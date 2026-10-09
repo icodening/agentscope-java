@@ -75,6 +75,11 @@ public class E2bFilesystemSpec extends SandboxFilesystemSpec {
         return this;
     }
 
+    public E2bFilesystemSpec codec(E2bCodec codec) {
+        options.setCodec(codec);
+        return this;
+    }
+
     public E2bFilesystemSpec connectTimeoutSeconds(int connectTimeoutSeconds) {
         options.setConnectTimeoutSeconds(connectTimeoutSeconds);
         return this;
@@ -87,6 +92,17 @@ public class E2bFilesystemSpec extends SandboxFilesystemSpec {
 
     public E2bFilesystemSpec maxRetries(int maxRetries) {
         options.setMaxRetries(maxRetries);
+        return this;
+    }
+
+    /**
+     * Maximum number of snapshots created by this session that are kept on shutdown; {@code <= 0}
+     * disables pruning. Defaults to {@code 0} (disabled), matching the historical no-pruning
+     * behaviour. See {@link E2bSandboxClientOptions#setSnapshotRetention(int)} for the full
+     * contract.
+     */
+    public E2bFilesystemSpec snapshotRetention(int snapshotRetention) {
+        options.setSnapshotRetention(snapshotRetention);
         return this;
     }
 
